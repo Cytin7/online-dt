@@ -20,7 +20,7 @@ import numpy as np
 import utils
 from replay_buffer import ReplayBuffer
 from lamb import Lamb
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
 from pathlib import Path
 from data import create_dataloader
 from decision_transformer.models.decision_transformer import DecisionTransformer
@@ -42,7 +42,7 @@ except Exception:
 
 class Experiment:
     def __init__(self, variant):
-        self.dataset = minari.load_dataset(variant["dataset"])  # load minari dataset
+        self.dataset = minari.load_dataset(variant["dataset"], download=True)  # load minari dataset
         self.state_dim, self.act_dim, self.action_range = self._get_env_spec(self.dataset)
         self.offline_trajs, self.state_mean, self.state_std = self._load_dataset(self.dataset)
         # initialize by offline trajs
@@ -310,6 +310,7 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                num_workers=self.variant["num_workers"],
             )
 
             train_outputs = trainer.train_iteration(
@@ -392,6 +393,7 @@ class Experiment:
                 state_std=self.state_std,
                 reward_scale=self.reward_scale,
                 action_range=self.action_range,
+                num_workers=self.variant["num_workers"],
             )
 
             # finetuning
@@ -501,7 +503,9 @@ class Experiment:
         #     print(f"Generated the fixed target goal: {target_goal}")
         # else:
         #     target_goal = None
-        eval_envs = SubprocVecEnv(
+
+        # eval_envs = SubprocVecEnv(
+        eval_envs = DummyVecEnv(
             [get_env_builder(i, dataset_id, eval_env=True) for i in range(self.variant["num_eval_episodes"])]
         )
 
@@ -511,7 +515,8 @@ class Experiment:
 
         if self.variant["max_online_iters"]:
             print("\n\nMaking Online Env.....")
-            online_envs = SubprocVecEnv(
+            # online_envs = SubprocVecEnv(
+            online_envs = DummyVecEnv(
                 [
                     get_env_builder(i + 100, dataset_id, eval_env=False)
                     for i in range(self.variant["num_online_rollouts"])
@@ -542,7 +547,7 @@ if __name__ == "__main__":
 
     # shared evaluation options
     parser.add_argument("--eval_rtg", type=int, default=3600)
-    parser.add_argument("--num_eval_episodes", type=int, default=4)
+    parser.add_argument("--num_eval_episodes", type=int, default=1)
 
     # shared training options
     parser.add_argument("--init_temperature", type=float, default=0.1)
@@ -552,11 +557,12 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=10000)
 
     # pretraining options
-    parser.add_argument("--max_pretrain_iters", type=int, default=1)
+    parser.add_argument("--max_pretrain_iters", type=int, default=0) # set to 0 to disable pretraining
     parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
+    parser.add_argument("--num_workers", type=int, default=1)
 
     # finetuning options
-    parser.add_argument("--max_online_iters", type=int, default=1500)
+    parser.add_argument("--max_online_iters", type=int, default=10)
     parser.add_argument("--online_rtg", type=int, default=7200)
     parser.add_argument("--num_online_rollouts", type=int, default=1)
     parser.add_argument("--replay_size", type=int, default=1000)
@@ -570,6 +576,8 @@ if __name__ == "__main__":
     parser.add_argument("--exp_name", type=str, default="default")
 
     args = parser.parse_args()
+    print("Experiment Parameters:")
+    print(vars(args))
 
     utils.set_seed_everywhere(args.seed)
     experiment = Experiment(vars(args))
