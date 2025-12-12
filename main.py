@@ -10,8 +10,10 @@ import argparse
 import pickle
 import random
 import time
-import gym
-import d4rl
+import gymnasium as gym  # changed to gymnasium
+
+# import d4rl # no longer supported, replaced by minari
+import minari  # use minari for datasets
 import torch
 import numpy as np
 
@@ -28,14 +30,21 @@ from logger import Logger
 
 MAX_EPISODE_LEN = 1000
 
+# Register gymnasium robotics envs if available
+# Used for antmaze tasks in minari
+try:
+    import gymnasium_robotics
+
+    gym.register_envs(gymnasium_robotics)
+except Exception:
+    pass
+
 
 class Experiment:
     def __init__(self, variant):
-
-        self.state_dim, self.act_dim, self.action_range = self._get_env_spec(variant)
-        self.offline_trajs, self.state_mean, self.state_std = self._load_dataset(
-            variant["env"]
-        )
+        self.dataset = minari.load_dataset(variant["dataset"])  # load minari dataset
+        self.state_dim, self.act_dim, self.action_range = self._get_env_spec(self.dataset)
+        self.offline_trajs, self.state_mean, self.state_std = self._load_dataset(self.dataset)
         # initialize by offline trajs
         self.replay_buffer = ReplayBuffer(variant["replay_size"], self.offline_trajs)
 
@@ -86,11 +95,16 @@ class Experiment:
         self.online_iter = 0
         self.total_transitions_sampled = 0
         self.variant = variant
-        self.reward_scale = 1.0 if "antmaze" in variant["env"] else 0.001
+        self.reward_scale = 1.0 if "antmaze" in variant["dataset"] else 0.001
         self.logger = Logger(variant)
 
-    def _get_env_spec(self, variant):
-        env = gym.make(variant["env"])
+    def _wrap_env_for_dt(self, env):
+        if isinstance(env.observation_space, gym.spaces.Dict):
+            env = gym.wrappers.FlattenObservation(env)
+        return env
+
+    def _get_env_spec(self, dataset):
+        env = self._wrap_env_for_dt(dataset.recover_environment())
         state_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
         action_range = [
@@ -131,9 +145,7 @@ class Experiment:
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            self.log_temperature_optimizer.load_state_dict(
-                checkpoint["log_temperature_optimizer_state_dict"]
-            )
+            self.log_temperature_optimizer.load_state_dict(checkpoint["log_temperature_optimizer_state_dict"])
             self.pretrain_iter = checkpoint["pretrain_iter"]
             self.online_iter = checkpoint["online_iter"]
             self.total_transitions_sampled = checkpoint["total_transitions_sampled"]
@@ -142,11 +154,50 @@ class Experiment:
             torch.set_rng_state(checkpoint["pytorch"])
             print(f"Model loaded at {path_prefix}/model.pt")
 
-    def _load_dataset(self, env_name):
+    def _episode_to_traj(self, ep, obs_space):
+        """
+        Code adapted from d4rl to minari dataset API
+        This part is provided by ChatGPT
+        """
+        obs = ep.observations
+        act = ep.actions
+        rew = ep.rewards
+        done = np.logical_or(ep.terminations, ep.truncations).astype(np.float32)
 
-        dataset_path = f"./data/{env_name}.pkl"
-        with open(dataset_path, "rb") as f:
-            trajectories = pickle.load(f)
+        T = act.shape[0]
+        if isinstance(obs, dict):
+            obs = {k: v[:-1] for k, v in obs.items()}  # drop final obs
+            obs_flat = np.stack(
+                [gym.spaces.flatten(obs_space, {k: obs[k][t] for k in obs.keys()}) for t in range(T)],
+                axis=0,
+            )
+        else:
+            if obs.shape[0] == T + 1:
+                obs = obs[:-1]
+            obs_flat = obs
+
+        if done.shape[0] == T + 1:
+            done = done[:-1]
+
+        return {
+            "observations": np.asarray(obs_flat, dtype=np.float32),
+            "actions": np.asarray(act, dtype=np.float32),
+            "rewards": np.asarray(rew, dtype=np.float32),
+            "terminals": np.asarray(done, dtype=np.float32),
+        }
+
+    def _load_dataset(self, dataset):
+        env_raw = dataset.recover_environment()
+        obs_space_raw = env_raw.observation_space
+        env_raw.close()
+
+        trajectories = []
+        for ep in dataset.iterate_episodes():  # changed to minari dataset API
+            trajectories.append(self._episode_to_traj(ep, obs_space_raw))
+
+        # dataset_path = f"./data/{env_name}.pkl"
+        # with open(dataset_path, "rb") as f:
+        #     trajectories = pickle.load(f)
 
         states, traj_lens, returns = [], [], []
         for path in trajectories:
@@ -161,7 +212,7 @@ class Experiment:
         num_timesteps = sum(traj_lens)
 
         print("=" * 50)
-        print(f"Starting new experiment: {env_name}")
+        print(f"Starting new experiment: {self.dataset.spec.dataset_id}")
         print(f"{len(traj_lens)} trajectories, {num_timesteps} timesteps found")
         print(f"Average return: {np.mean(returns):.2f}, std: {np.std(returns):.2f}")
         print(f"Max return: {np.max(returns):.2f}, min: {np.min(returns):.2f}")
@@ -245,9 +296,7 @@ class Experiment:
             device=self.device,
         )
 
-        writer = (
-            SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
-        )
+        writer = SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
         while self.pretrain_iter < self.variant["max_pretrain_iters"]:
             # in every iteration, prepare the data loader
             dataloader = create_dataloader(
@@ -321,9 +370,7 @@ class Experiment:
                 reward_scale=self.reward_scale,
             )
         ]
-        writer = (
-            SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
-        )
+        writer = SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
         while self.online_iter < self.variant["max_online_iters"]:
 
             outputs = {}
@@ -349,9 +396,7 @@ class Experiment:
 
             # finetuning
             is_last_iter = self.online_iter == self.variant["max_online_iters"] - 1
-            if (self.online_iter + 1) % self.variant[
-                "eval_interval"
-            ] == 0 or is_last_iter:
+            if (self.online_iter + 1) % self.variant["eval_interval"] == 0 or is_last_iter:
                 evaluation = True
             else:
                 evaluation = False
@@ -387,7 +432,8 @@ class Experiment:
 
         utils.set_seed_everywhere(args.seed)
 
-        import d4rl
+        # import d4rl
+        import minari
 
         def loss_fn(
             a_hat_dist,
@@ -407,42 +453,56 @@ class Experiment:
                 entropy,
             )
 
-        def get_env_builder(seed, env_name, target_goal=None):
+        # def get_env_builder(seed, env_name, target_goal=None):
+        #     def make_env_fn():
+        #         import d4rl
+        #
+        #         env = gym.make(env_name)
+        #         env.seed(seed)
+        #         if hasattr(env.env, "wrapped_env"):
+        #             env.env.wrapped_env.seed(seed)
+        #         elif hasattr(env.env, "seed"):
+        #             env.env.seed(seed)
+        #         else:
+        #             pass
+        #         env.action_space.seed(seed)
+        #         env.observation_space.seed(seed)
+        #
+        #         if target_goal:
+        #             env.set_target_goal(target_goal)
+        #             print(f"Set the target goal to be {env.target_goal}")
+        #         return env
+        #
+        #     return make_env_fn
+
+        def get_env_builder(seed, dataset_id, eval_env=False):
+            """
+            Load minari env and set seed
+            This part is provided by ChatGPT
+            """
+
             def make_env_fn():
-                import d4rl
+                dataset = minari.load_dataset(dataset_id)
+                env = dataset.recover_environment(eval_env=eval_env)
+                env = self._wrap_env_for_dt(env)
 
-                env = gym.make(env_name)
-                env.seed(seed)
-                if hasattr(env.env, "wrapped_env"):
-                    env.env.wrapped_env.seed(seed)
-                elif hasattr(env.env, "seed"):
-                    env.env.seed(seed)
-                else:
-                    pass
+                env.reset(seed=seed)
                 env.action_space.seed(seed)
-                env.observation_space.seed(seed)
-
-                if target_goal:
-                    env.set_target_goal(target_goal)
-                    print(f"Set the target goal to be {env.target_goal}")
                 return env
 
             return make_env_fn
 
         print("\n\nMaking Eval Env.....")
-        env_name = self.variant["env"]
-        if "antmaze" in env_name:
-            env = gym.make(env_name)
-            target_goal = env.target_goal
-            env.close()
-            print(f"Generated the fixed target goal: {target_goal}")
-        else:
-            target_goal = None
+        dataset_id = self.variant["dataset"]
+        # if "antmaze" in env_name:
+        #     env = gym.make(env_name)
+        #     target_goal = env.target_goal
+        #     env.close()
+        #     print(f"Generated the fixed target goal: {target_goal}")
+        # else:
+        #     target_goal = None
         eval_envs = SubprocVecEnv(
-            [
-                get_env_builder(i, env_name=env_name, target_goal=target_goal)
-                for i in range(self.variant["num_eval_episodes"])
-            ]
+            [get_env_builder(i, dataset_id, eval_env=True) for i in range(self.variant["num_eval_episodes"])]
         )
 
         self.start_time = time.time()
@@ -453,7 +513,7 @@ class Experiment:
             print("\n\nMaking Online Env.....")
             online_envs = SubprocVecEnv(
                 [
-                    get_env_builder(i + 100, env_name=env_name, target_goal=target_goal)
+                    get_env_builder(i + 100, dataset_id, eval_env=False)
                     for i in range(self.variant["num_online_rollouts"])
                 ]
             )
@@ -466,7 +526,8 @@ class Experiment:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=10)
-    parser.add_argument("--env", type=str, default="hopper-medium-v2")
+    # parser.add_argument("--env", type=str, default="hopper-medium-v2")
+    parser.add_argument("--dataset", type=str, default="mujoco/hopper/medium-v0")
 
     # model options
     parser.add_argument("--K", type=int, default=20)
@@ -481,7 +542,7 @@ if __name__ == "__main__":
 
     # shared evaluation options
     parser.add_argument("--eval_rtg", type=int, default=3600)
-    parser.add_argument("--num_eval_episodes", type=int, default=10)
+    parser.add_argument("--num_eval_episodes", type=int, default=4)
 
     # shared training options
     parser.add_argument("--init_temperature", type=float, default=0.1)
